@@ -30,9 +30,14 @@ class BTCFinder:
             if not address or not isinstance(address, str):
                 return False
             
-            # Bitcoin addresses should be between 26-35 characters
-            if len(address) < 26 or len(address) > 35:
-                return False
+            # Bitcoin legacy addresses should be between 26-35 characters
+            # Bech32 addresses can be up to 90 characters
+            if address.startswith('bc1'):
+                if len(address) < 14 or len(address) > 90:
+                    return False
+            else:
+                if len(address) < 26 or len(address) > 35:
+                    return False
             
             # Check if it starts with valid prefix (1, 3, or bc1)
             if not (address.startswith('1') or address.startswith('3') or address.startswith('bc1')):
@@ -55,8 +60,10 @@ class BTCFinder:
             
             # For bech32 addresses (starting with bc1), basic validation
             if address.startswith('bc1'):
-                # Basic bech32 validation (simplified)
-                return all(c in '023456789acdefghjklmnpqrstuvwxyz' for c in address[3:].lower())
+                # Basic bech32 character set validation (simplified)
+                # Full bech32 validation would require checksum verification
+                bech32_charset = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+                return all(c in bech32_charset for c in address[3:].lower())
             
             return False
         except Exception:
