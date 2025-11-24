@@ -12,8 +12,9 @@ import hashlib
 import binascii
 import mmap
 import re
+import time
 from typing import List, Tuple, Optional, Set
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import namedtuple
 
 # Data structures for findings
@@ -104,43 +105,163 @@ class WalletRecoveryTool:
         self.log_file.write(log_entry + "\n")
         self.log_file.flush()
         
-    def scan_for_berkeley_db(self, data: bytes, base_offset: int = 0) -> List[Tuple[int, str]]:
+    def validate_berkeley_db_context(self, data: bytes, magic_offset: int) -> tuple:
         """
-        Scan for Berkeley DB signatures
+        Validate Berkeley DB context and return confidence level
+        
+        Args:
+            data: Chunk of data containing potential BDB magic
+            magic_offset: Offset of magic bytes within data chunk
+            
+        Returns:
+            Tuple of (is_valid, confidence_score, reason)
+            confidence_score: 0.0-1.0 (0.3=low, 0.6=medium, 0.9=high)
+        """
+        # Need at least 28 bytes for validation
+        if magic_offset < 12 or magic_offset + 16 > len(data):
+            return (False, 0.3, "insufficient_context")
+        
+        page_header_start = magic_offset - 12
+        if page_header_start < 0 or page_header_start + 28 > len(data):
+            return (False, 0.3, "boundary_issue")
+            
+        page_header = data[page_header_start:page_header_start + 28]
+        
+        confidence = 0.3  # Start with low confidence
+        issues = []
+        
+        # Check magic at offset 12
+        magic_bytes = page_header[12:16]
+        if magic_bytes == b'\x62\x31\x05\x00':
+            confidence += 0.2
+        
+        # Check BDB version field (should be 7-9 for 2011 era)
+        try:
+            version_bytes = struct.unpack('<I', page_header[16:20])[0]
+            if version_bytes in [7, 8, 9]:
+                confidence += 0.3
+            elif version_bytes < 20:  # Plausible version
+                confidence += 0.1
+            else:
+                issues.append(f"version={version_bytes}")
+        except:
+            issues.append("version_unpack_error")
+        
+        # Check page size (should be power of 2, typically 2KB-16KB)
+        try:
+            if len(page_header) >= 24:
+                page_size = struct.unpack('<I', page_header[20:24])[0]
+                if page_size in [2048, 4096, 8192, 16384]:
+                    confidence += 0.2
+                elif page_size > 0 and page_size < 65536 and (page_size & (page_size - 1)) == 0:
+                    confidence += 0.1  # Power of 2 but unusual size
+                else:
+                    issues.append(f"pagesize={page_size}")
+        except:
+            issues.append("pagesize_error")
+        
+        # Check page number (first few pages more likely)
+        try:
+            page_num = struct.unpack('<I', page_header[8:12])[0]
+            if page_num == 0:
+                confidence += 0.1  # First page is good
+            elif page_num < 100:
+                confidence += 0.05
+            elif page_num > 10000:
+                issues.append(f"pagenum={page_num}")
+        except:
+            issues.append("pagenum_error")
+        
+        reason = f"score={confidence:.2f}"
+        if issues:
+            reason += f" issues={','.join(issues)}"
+            
+        return (confidence >= 0.5, confidence, reason)
+    
+    def scan_for_berkeley_db(self, data: bytes, base_offset: int = 0) -> List[Tuple[int, str, float]]:
+        """
+        Scan for Berkeley DB signatures with confidence scoring
         
         Returns:
-            List of (offset, description) tuples
+            List of (offset, description, confidence) tuples
         """
         findings = []
         
-        for sig_offset, signature, description in self.berkeley_signatures:
-            # Search for signature in data
+        # HIGHEST PRIORITY: Complete 2011 wallet headers (8KB pages)
+        wallet_header_8k = b'\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x62\x31\x05\x00\x09\x00\x00\x00\x00\x20\x00\x00'
+        offset = 0
+        while offset < len(data) - len(wallet_header_8k):
+            pos = data.find(wallet_header_8k, offset)
+            if pos == -1:
+                break
+            actual_pos = base_offset + pos
+            if actual_pos not in self.processed_offsets:
+                findings.append((actual_pos, "Complete 2011 wallet.dat header v9 (8KB pages)", 0.95))
+                self.processed_offsets.add(actual_pos)
+            offset = pos + 1
+        
+        # Complete wallet header (4KB pages)
+        wallet_header_4k = b'\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x62\x31\x05\x00\x09\x00\x00\x00\x00\x10\x00\x00'
+        offset = 0
+        while offset < len(data) - len(wallet_header_4k):
+            pos = data.find(wallet_header_4k, offset)
+            if pos == -1:
+                break
+            actual_pos = base_offset + pos
+            if actual_pos not in self.processed_offsets:
+                findings.append((actual_pos, "Complete 2011 wallet.dat header v9 (4KB pages)", 0.95))
+                self.processed_offsets.add(actual_pos)
+            offset = pos + 1
+        
+        # Search for BDB v9 magic with version (more specific than magic alone)
+        bdb_v9_pattern = b'\x62\x31\x05\x00\x09\x00\x00\x00'
+        offset = 0
+        while offset < len(data) - len(bdb_v9_pattern):
+            pos = data.find(bdb_v9_pattern, offset)
+            if pos == -1:
+                break
+            
+            # This should be at offset 12 in a page header
+            actual_pos = base_offset + pos - 12 if pos >= 12 else base_offset + pos
+            
+            if actual_pos not in self.processed_offsets:
+                # Validate context for better confidence
+                is_valid, confidence, reason = self.validate_berkeley_db_context(data, pos)
+                
+                if confidence >= 0.6:  # Only report medium+ confidence
+                    findings.append((actual_pos, f"Berkeley DB v9 signature (confidence: {confidence:.2f}, {reason})", confidence))
+                    self.processed_offsets.add(actual_pos)
+                # Even low confidence - still extract keys, just don't spam output
+                elif confidence >= 0.3:
+                    findings.append((actual_pos, f"Possible BDB v9 fragment (low confidence: {confidence:.2f})", confidence))
+                    self.processed_offsets.add(actual_pos)
+            
+            offset = pos + 1
+        
+        # Also check for OTHER Berkeley DB signatures from the original list
+        # but with context validation
+        other_signatures = [
+            (b'\x00\x06\x15\x61', 'Berkeley DB Btree magic (0x00061561)'),
+            (b'\x00\x05\x31\x62', 'Berkeley DB Btree magic (0x00053162)'),
+        ]
+        
+        for signature, description in other_signatures:
             offset = 0
             while offset < len(data) - len(signature):
                 pos = data.find(signature, offset)
                 if pos == -1:
                     break
-                    
-                actual_pos = base_offset + pos - sig_offset
-                if actual_pos >= 0 and actual_pos not in self.processed_offsets:
-                    findings.append((actual_pos, description))
+                
+                # These signatures should appear at offset 12
+                actual_pos = base_offset + pos - 12 if pos >= 12 else base_offset + pos
+                
+                if actual_pos not in self.processed_offsets:
+                    # Lighter validation for alternative signatures
+                    confidence = 0.5  # Medium confidence by default
+                    findings.append((actual_pos, f"{description} (unvalidated)", confidence))
                     self.processed_offsets.add(actual_pos)
-                    
+                
                 offset = pos + 1
-                
-        # Search for full wallet header
-        offset = 0
-        while offset < len(data) - len(self.wallet_header_pattern):
-            pos = data.find(self.wallet_header_pattern, offset)
-            if pos == -1:
-                break
-                
-            actual_pos = base_offset + pos
-            if actual_pos not in self.processed_offsets:
-                findings.append((actual_pos, "Full wallet.dat header pattern"))
-                self.processed_offsets.add(actual_pos)
-                
-            offset = pos + 1
             
         return findings
     
@@ -225,21 +346,39 @@ class WalletRecoveryTool:
                             
         return keys
     
-    def carve_wallet_region(self, file_handle, offset: int, size: int = 10485760) -> bytes:
+    def carve_wallet_region(self, file_handle, offset: int, size: int = 2097152) -> bytes:
         """
         Carve out a region around a potential wallet location
         
+        For 2011 minimal-use wallets:
+        - Typical size: 60-125 KB (metadata + key pool + 1-2 keys)
+        - Page size: 4KB or 8KB
+        - Strategy: Start before the signature to catch page 0, extend after
+        
         Args:
             file_handle: File handle to disk image
-            offset: Starting offset
-            size: Size to carve (default 10MB)
+            offset: Starting offset (usually points to page 0 or metadata page)
+            size: Size to carve (default 2MB for high confidence)
             
         Returns:
             Carved data bytes
         """
         try:
-            file_handle.seek(max(0, offset))
-            return file_handle.read(size)
+            # For wallet.dat, the offset typically points to page 0 (metadata page)
+            # We want to start from there and read forward
+            # Also read a bit backwards in case we're at a middle page
+            read_before = min(65536, offset)  # Read up to 64KB before (catch earlier pages)
+            start_offset = offset - read_before
+            total_size = size + read_before
+            
+            file_handle.seek(max(0, start_offset))
+            carved_data = file_handle.read(total_size)
+            
+            # Log carving details for high-value findings
+            if size >= 524288:  # If carving 512KB or more
+                self.log(f"Carved {len(carved_data)} bytes from 0x{start_offset:X} to 0x{start_offset + len(carved_data):X}")
+            
+            return carved_data
         except Exception as e:
             self.log(f"Error carving region at offset 0x{offset:X}: {e}", "ERROR")
             return b''
@@ -287,6 +426,11 @@ class WalletRecoveryTool:
             chunk_size = 104857600  # 100MB
             overlap = 65536  # 64KB overlap to catch patterns on boundaries
             
+            # Track statistics for progress
+            start_time = time.time()
+            total_findings = 0
+            last_log_time = start_time
+            
             with open(self.disk_image_path, 'rb') as f:
                 offset = 0
                 chunk_num = 0
@@ -302,38 +446,87 @@ class WalletRecoveryTool:
                     chunk_num += 1
                     actual_offset = max(0, offset - overlap)
                     
-                    # Progress update
+                    # Progress update with enhanced information
                     progress = (offset / file_size) * 100
-                    self.log(f"Scanning chunk {chunk_num} - Offset: 0x{offset:X} ({progress:.2f}% complete)")
+                    elapsed = time.time() - start_time
+                    
+                    if elapsed > 0:
+                        speed_mb_s = (offset / (1024 * 1024)) / elapsed
+                        remaining_bytes = file_size - offset
+                        eta_seconds = remaining_bytes / (offset / elapsed) if offset > 0 else 0
+                        eta = str(timedelta(seconds=int(eta_seconds)))
+                    else:
+                        speed_mb_s = 0
+                        eta = "calculating..."
+                    
+                    # Print inline progress (overwrites same line)
+                    progress_msg = (f"\rProgress: {progress:.1f}% | "
+                                  f"Offset: 0x{offset:X} | "
+                                  f"Speed: {speed_mb_s:.1f} MB/s | "
+                                  f"ETA: {eta} | "
+                                  f"Findings: {total_findings}")
+                    print(progress_msg, end='', flush=True)
+                    
+                    # Log to file every 5% or every 60 seconds
+                    current_time = time.time()
+                    if progress % 5 < 0.1 or (current_time - last_log_time) > 60:
+                        self.log(f"Chunk {chunk_num}: {progress:.1f}% complete - {total_findings} findings so far")
+                        last_log_time = current_time
                     
                     # Scan for Berkeley DB signatures
                     berkeley_findings = self.scan_for_berkeley_db(chunk, actual_offset)
-                    for finding_offset, description in berkeley_findings:
-                        self.log(f"Found Berkeley DB signature at 0x{finding_offset:X}: {description}")
+                    for finding_offset, description, confidence in berkeley_findings:
+                        total_findings += 1
                         
-                        # Carve out region around Berkeley DB header
-                        self.log(f"Carving potential wallet region at 0x{finding_offset:X}")
-                        carved_data = self.carve_wallet_region(f, finding_offset, 10485760)  # 10MB
+                        # Only print for medium+ confidence to reduce spam
+                        if confidence >= 0.6:
+                            print()  # New line before important finding
+                            self.log(f"Found Berkeley DB signature at 0x{finding_offset:X}: {description}")
+                        elif confidence >= 0.9:
+                            print()
+                            self.log(f"!!! HIGH CONFIDENCE WALLET HEADER at 0x{finding_offset:X}: {description} !!!", "CRITICAL")
                         
-                        # Save carved region
-                        carved_filename = os.path.join(self.output_dir, f"wallet_candidate_{finding_offset:X}.dat")
+                        # ALWAYS carve and extract keys, even from low confidence findings
+                        # (formatted drive = fragmented data, can't be too picky)
+                        
+                        # Smart carving size based on confidence level:
+                        # HIGH (0.8+): 2MB - likely complete wallet header, grab comprehensive region
+                        # MEDIUM (0.5-0.8): 512KB - probably wallet fragment, moderate search
+                        # LOW (0.3-0.5): 128KB - possible false positive, minimal carve
+                        if confidence >= 0.8:
+                            carve_size = 2097152  # 2MB
+                        elif confidence >= 0.5:
+                            carve_size = 524288   # 512KB
+                        else:
+                            carve_size = 131072   # 128KB
+                        
+                        carved_data = self.carve_wallet_region(f, finding_offset, carve_size)
+                        
+                        # Save carved region with confidence in filename
+                        conf_label = "HIGH" if confidence >= 0.8 else "MED" if confidence >= 0.5 else "LOW"
+                        carved_filename = os.path.join(self.output_dir, f"wallet_candidate_{conf_label}_{finding_offset:X}.dat")
                         with open(carved_filename, 'wb') as carved_file:
                             carved_file.write(carved_data)
-                        self.log(f"Saved carved data to {carved_filename}")
+                        
+                        if confidence >= 0.6:
+                            self.log(f"Saved carved data to {carved_filename}")
                         
                         # Create wallet candidate
+                        confidence_str = "HIGH" if confidence >= 0.8 else "MEDIUM" if confidence >= 0.5 else "LOW"
                         candidate = WalletCandidate(
                             offset=finding_offset,
                             signature_type=description,
-                            confidence="HIGH" if "Full wallet" in description else "MEDIUM",
+                            confidence=confidence_str,
                             data_preview=carved_data[:1024]
                         )
                         self.wallet_candidates.append(candidate)
                         
-                        # Extract potential keys from carved region
+                        # CRITICAL: Extract keys from ALL regions (even low confidence)
+                        # On a formatted drive, we need to be aggressive
                         keys = self.extract_potential_keys(carved_data, finding_offset)
                         if keys:
-                            self.log(f"Extracted {len(keys)} potential private keys from region")
+                            if confidence >= 0.6:
+                                self.log(f"Extracted {len(keys)} potential private keys from region")
                             for key in keys:
                                 self.key_candidates.append(KeyCandidate(
                                     offset=finding_offset,
@@ -345,6 +538,8 @@ class WalletRecoveryTool:
                     # Scan for Bitcoin patterns
                     bitcoin_findings = self.scan_for_bitcoin_patterns(chunk, actual_offset)
                     for finding_offset, description in bitcoin_findings:
+                        total_findings += 1
+                        print()  # New line before important finding
                         self.log(f"Found Bitcoin pattern at 0x{finding_offset:X}: {description}")
                         
                         # If it's the target address, carve surrounding area
@@ -358,6 +553,14 @@ class WalletRecoveryTool:
                             self.log(f"Saved target address region to {carved_filename}", "CRITICAL")
                     
                     offset += chunk_size
+            
+            # Final newline after progress bar
+            print()
+            
+            # Log final statistics
+            total_time = time.time() - start_time
+            self.log(f"Scan completed in {str(timedelta(seconds=int(total_time)))}")
+            self.log(f"Total findings: {total_findings}")
                     
         except Exception as e:
             self.log(f"Error during scan: {e}", "ERROR")

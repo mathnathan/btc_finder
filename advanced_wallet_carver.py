@@ -10,7 +10,9 @@ import struct
 import hashlib
 import binascii
 import base58
+import time
 from typing import List, Dict, Optional, Tuple
+from datetime import timedelta
 import math
 from collections import defaultdict
 
@@ -347,6 +349,10 @@ class AdvancedWalletCarver:
             'private_keys': []
         }
         
+        # Track statistics for progress
+        start_time = time.time()
+        chunks_processed = 0
+        
         with open(self.disk_image_path, 'rb') as f:
             offset = 0
             
@@ -358,9 +364,35 @@ class AdvancedWalletCarver:
                 if not chunk:
                     break
                 
-                # Progress
+                chunks_processed += 1
+                
+                # Calculate progress metrics
                 progress = (offset / file_size) * 100
-                print(f"\rScanning: {progress:.1f}% (offset 0x{offset:X})", end='')
+                elapsed = time.time() - start_time
+                
+                if elapsed > 0:
+                    speed_mb_s = (offset / (1024 * 1024)) / elapsed
+                    remaining_bytes = file_size - offset
+                    eta_seconds = remaining_bytes / (offset / elapsed) if offset > 0 else 0
+                    eta = str(timedelta(seconds=int(eta_seconds)))
+                else:
+                    speed_mb_s = 0
+                    eta = "calculating..."
+                
+                # Count total findings
+                total_findings = (len(all_findings['berkeley_db']) + 
+                                len(all_findings['addresses']) + 
+                                len(all_findings['private_keys']))
+                
+                # Enhanced progress display
+                progress_msg = (f"\rProgress: {progress:.1f}% | "
+                              f"Chunk: {chunks_processed} | "
+                              f"Speed: {speed_mb_s:.1f} MB/s | "
+                              f"ETA: {eta} | "
+                              f"BDB: {len(all_findings['berkeley_db'])} | "
+                              f"Addrs: {len(all_findings['addresses'])} | "
+                              f"Keys: {len(all_findings['private_keys'])}")
+                print(progress_msg, end='', flush=True)
                 
                 # Search for Berkeley DB signatures
                 for ctx in self.berkeley_contexts:
@@ -372,11 +404,16 @@ class AdvancedWalletCarver:
                             'confidence': ctx['confidence']
                         }
                         all_findings['berkeley_db'].append(finding)
-                        print(f"\nFound: {ctx['name']} at 0x{offset + pos:X}")
+                        print(f"\n[FOUND] Berkeley DB: {ctx['name']} at 0x{offset + pos:X}")
                 
                 # Search for addresses
                 addr_findings = self.find_address_patterns(chunk, offset)
-                all_findings['addresses'].extend(addr_findings)
+                if addr_findings:
+                    all_findings['addresses'].extend(addr_findings)
+                    # Only print for target address findings
+                    for finding in addr_findings:
+                        if 'TARGET' in finding['type']:
+                            print(f"\n[FOUND] {finding['type']}: {finding['data']} at 0x{finding['offset']:X}")
                 
                 # Extract private keys
                 key_findings = self.extract_private_keys_advanced(chunk, offset)
@@ -385,7 +422,15 @@ class AdvancedWalletCarver:
                 # Move window (with overlap to catch patterns on boundaries)
                 offset += chunk_size - 1024  # 1KB overlap
         
-        print("\n\nScan complete!")
+        # Final newline and summary
+        print("\n")
+        total_time = time.time() - start_time
+        print(f"Scan complete in {str(timedelta(seconds=int(total_time)))}")
+        print(f"Total findings: {total_findings}")
+        print(f"  - Berkeley DB signatures: {len(all_findings['berkeley_db'])}")
+        print(f"  - Bitcoin addresses: {len(all_findings['addresses'])}")
+        print(f"  - Private key candidates: {len(all_findings['private_keys'])}")
+        
         return all_findings
     
     def generate_detailed_report(self, findings: Dict, output_dir: str = "./recovery_output"):
